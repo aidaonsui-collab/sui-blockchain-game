@@ -3,8 +3,11 @@ name = "shrooms"
 version = "1.0.0"
 edition = "2024.beta"
 
+[addresses]
+shrooms_token = "0x0"
+
 [dependencies]
 Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
 
-[addresses]
-shrooms = "0x0"
+[dev-addresses]
+shrooms_token = "0x0"

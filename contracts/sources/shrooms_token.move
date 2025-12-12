@@ -1,51 +1,55 @@
-module shrooms::shrooms_token {
+module shrooms_token::shrooms_token {
     use sui::coin::{Self, Coin, TreasuryCap};
     use sui::balance::{Self, Balance};
-    use sui::sui::SUI;
-    use sui::tx_context::{Self, TxContext};
+    use sui::tx_context::TxContext;
+    use sui::object::UID;
     use sui::transfer;
-    use sui::object::{Self, UID};
-    use std::option;
+    use sui::sui::SUI;  // Added SUI type import
 
-    // ======== Errors ========
-    const EInsufficientBalance: u64 = 0;
-    const EInvalidAmount: u64 = 1;
-    const ENotAuthorized: u64 = 2;
 
-    // ======== Types ========
-    
-    /// The SHROOMS token
+    // Error codes
+    const ENotEnoughPayment: u64 = 0;
+    const ENotAuthorized: u64 = 1;
+    const ETooEarly: u64 = 3;
+
+
+    /// Coin representing the $SHROOMS token
     public struct SHROOMS_TOKEN has drop {}
 
-    /// Global game state
+    /// Game state holding all farms and treasury
     public struct GameState has key {
         id: UID,
         treasury_cap: TreasuryCap<SHROOMS_TOKEN>,
-        dev_wallet: address,
+        farms: vector<Farm>,
         total_farms: u64,
-        total_harvested: u64,
-        fee_pool: Balance<SUI>,
+        total_shrooms_minted: u64,
+        fee_balance: Balance<SUI>,
+        dev_wallet: address,
     }
 
-    /// Farm owned by a player
-    public struct Farm has key, store {
-        id: UID,
+    /// Individual farm owned by a player
+    public struct Farm has store {
+        id: u64,
         owner: address,
-        mushroom_count: u64,
-        last_harvest: u64,
-        total_harvested: u64,
-        upgrade_level: u8,
+        mushrooms: u64,
+        level: u64,
+        last_harvest_epoch: u64,
+        created_at_epoch: u64,
     }
 
-    // ======== Init Function ========
-    
+    // Constants
+    const FARM_COST: u64 = 10_000_000_000; // 10 SUI
+    const INITIAL_MUSHROOMS: u64 = 10;
+    const UPGRADE_COST: u64 = 5_000_000_000; // 5 SUI
+
+    /// Initialize the game and create the $SHROOMS token
     fun init(witness: SHROOMS_TOKEN, ctx: &mut TxContext) {
         let (treasury_cap, metadata) = coin::create_currency(
             witness,
-            9, // decimals
+            6, // decimals
             b"SHROOMS",
-            b"Magic Shrooms",
-            b"The magic mushroom farming token on Sui",
+            b"Shrooms Token",
+            b"Farm mushrooms, harvest $SHROOMS tokens on Sui blockchain",
             option::none(),
             ctx
         );
@@ -55,130 +59,137 @@ module shrooms::shrooms_token {
         let game_state = GameState {
             id: object::new(ctx),
             treasury_cap,
-            dev_wallet: @0x2c478b5f158e037cb21b3443a5a3512f6fee0b9a16d7a261baa00ddca69d6fc5,
+            farms: vector::empty(),
             total_farms: 0,
-            total_harvested: 0,
-            fee_pool: balance::zero(),
+            total_shrooms_minted: 0,
+            fee_balance: balance::zero(),
+            dev_wallet: tx_context::sender(ctx),
         };
 
         transfer::share_object(game_state);
     }
 
-    // ======== Entry Functions ========
-    
-    /// Create a new farm (costs SUI)
+    /// Mint initial tokens for DEX liquidity (dev only)
+    public entry fun mint_for_liquidity(
+        game_state: &mut GameState,
+        amount: u64,
+        recipient: address,
+        ctx: &mut TxContext
+    ) {
+        assert!(tx_context::sender(ctx) == game_state.dev_wallet, ENotAuthorized);
+        
+        let minted_coin = coin::mint(&mut game_state.treasury_cap, amount, ctx);
+        transfer::public_transfer(minted_coin, recipient);
+        game_state.total_shrooms_minted = game_state.total_shrooms_minted + amount;
+    }
+
+    /// Create a new farm
     public entry fun create_farm(
         game_state: &mut GameState,
         payment: Coin<SUI>,
         ctx: &mut TxContext
     ) {
-        let farm_cost = 10_000_000_000; // 10 SUI
-        assert!(coin::value(&payment) >= farm_cost, EInsufficientBalance);
+        assert!(coin::value(&payment) >= FARM_COST, ENotEnoughPayment);
 
-        // Add payment to fee pool
         let payment_balance = coin::into_balance(payment);
-        balance::join(&mut game_state.fee_pool, payment_balance);
+        balance::join(&mut game_state.fee_balance, payment_balance);
 
         let farm = Farm {
-            id: object::new(ctx),
+            id: game_state.total_farms,
             owner: tx_context::sender(ctx),
-            mushroom_count: 10, // Start with 10 mushrooms
-            last_harvest: tx_context::epoch(ctx),
-            total_harvested: 0,
-            upgrade_level: 1,
+            mushrooms: INITIAL_MUSHROOMS,
+            level: 1,
+            last_harvest_epoch: tx_context::epoch(ctx),
+            created_at_epoch: tx_context::epoch(ctx),
         };
 
+        vector::push_back(&mut game_state.farms, farm);
         game_state.total_farms = game_state.total_farms + 1;
-        transfer::transfer(farm, tx_context::sender(ctx));
     }
 
-    /// Plant more mushrooms (costs SHROOMS)
-    public entry fun plant_mushrooms(
-        farm: &mut Farm,
-        payment: Coin<SHROOMS_TOKEN>,
-        amount: u64,
-        ctx: &mut TxContext
-    ) {
-        assert!(farm.owner == tx_context::sender(ctx), ENotAuthorized);
-        assert!(amount > 0, EInvalidAmount);
-        
-        let plant_cost = amount * 100_000_000; // 0.1 SHROOMS per mushroom
-        assert!(coin::value(&payment) >= plant_cost, EInsufficientBalance);
-
-        transfer::public_transfer(payment, @0x0000000000000000000000000000000000000000000000000000000000000000);
-        farm.mushroom_count = farm.mushroom_count + amount;
-    }
-
-    /// Harvest mushrooms to earn SHROOMS
+    /// Harvest $SHROOMS tokens from a farm
     public entry fun harvest(
         game_state: &mut GameState,
-        farm: &mut Farm,
+        farm_id: u64,
         ctx: &mut TxContext
     ) {
-        assert!(farm.owner == tx_context::sender(ctx), ENotAuthorized);
-        
+        let sender = tx_context::sender(ctx);
         let current_epoch = tx_context::epoch(ctx);
-        let epochs_passed = current_epoch - farm.last_harvest;
         
-        // Calculate yield: mushroom_count * epochs_passed * upgrade_level * base_yield
-        let base_yield = 50_000_000; // 0.05 SHROOMS per mushroom per epoch
-        let yield = (farm.mushroom_count * epochs_passed * (farm.upgrade_level as u64) * base_yield);
-        
-        // Mint SHROOMS tokens
-        let shrooms = coin::mint(&mut game_state.treasury_cap, yield, ctx);
-        transfer::public_transfer(shrooms, tx_context::sender(ctx));
-        
-        farm.last_harvest = current_epoch;
-        farm.total_harvested = farm.total_harvested + yield;
-        game_state.total_harvested = game_state.total_harvested + yield;
+        let farm_ref = vector::borrow_mut(&mut game_state.farms, farm_id);
+        assert!(farm_ref.owner == sender, ENotAuthorized);
+
+        let epochs_passed = current_epoch - farm_ref.last_harvest_epoch;
+        assert!(epochs_passed > 0, ETooEarly);
+
+        let yield_amount = calculate_yield(
+            farm_ref.mushrooms,
+            epochs_passed,
+            farm_ref.level
+        );
+
+        let minted_coin = coin::mint(&mut game_state.treasury_cap, yield_amount, ctx);
+        transfer::public_transfer(minted_coin, sender);
+
+        farm_ref.last_harvest_epoch = current_epoch;
+        game_state.total_shrooms_minted = game_state.total_shrooms_minted + yield_amount;
     }
 
-    /// Upgrade farm (costs SUI and SHROOMS)
+    /// Calculate yield based on mushrooms, epochs, and level
+    fun calculate_yield(mushrooms: u64, epochs: u64, level: u64): u64 {
+        let base_yield = mushrooms * epochs * level;
+        (base_yield * 5) / 100 // 0.05 multiplier
+    }
+
+    /// Plant more mushrooms on a farm
+    public entry fun plant_mushrooms(
+        game_state: &mut GameState,
+        farm_id: u64,
+        amount: u64,
+        ctx: &mut TxContext
+    ) {
+        let farm_ref = vector::borrow_mut(&mut game_state.farms, farm_id);
+        assert!(farm_ref.owner == tx_context::sender(ctx), ENotAuthorized);
+        farm_ref.mushrooms = farm_ref.mushrooms + amount;
+    }
+
+    /// Upgrade a farm to increase yield multiplier
     public entry fun upgrade_farm(
         game_state: &mut GameState,
-        farm: &mut Farm,
-        sui_payment: Coin<SUI>,
-        shrooms_payment: Coin<SHROOMS_TOKEN>,
+        payment: Coin<SUI>,
+        farm_id: u64,
         ctx: &mut TxContext
     ) {
-        assert!(farm.owner == tx_context::sender(ctx), ENotAuthorized);
+        assert!(coin::value(&payment) >= UPGRADE_COST, ENotEnoughPayment);
+
+        let payment_balance = coin::into_balance(payment);
+        balance::join(&mut game_state.fee_balance, payment_balance);
+
+        let farm_ref = vector::borrow_mut(&mut game_state.farms, farm_id);
+        assert!(farm_ref.owner == tx_context::sender(ctx), ENotAuthorized);
         
-        let level_multiplier = (farm.upgrade_level as u64);
-        let upgrade_cost_sui = 2_000_000_000 * level_multiplier; // 2 SUI * level
-        let upgrade_cost_shrooms = 5_000_000_000 * level_multiplier; // 5 SHROOMS * level
-        
-        assert!(coin::value(&sui_payment) >= upgrade_cost_sui, EInsufficientBalance);
-        assert!(coin::value(&shrooms_payment) >= upgrade_cost_shrooms, EInsufficientBalance);
-        
-        // Add SUI payment to fee pool
-        let sui_balance = coin::into_balance(sui_payment);
-        balance::join(&mut game_state.fee_pool, sui_balance);
-        
-        // Burn SHROOMS payment
-        transfer::public_transfer(shrooms_payment, @0x0000000000000000000000000000000000000000000000000000000000000000);
-        
-        farm.upgrade_level = farm.upgrade_level + 1;
+        farm_ref.level = farm_ref.level + 1;
     }
 
-    /// Withdraw dev fees
+    /// Withdraw accumulated fees (dev only)
     public entry fun withdraw_fees(
         game_state: &mut GameState,
-        amount: u64,
         ctx: &mut TxContext
     ) {
         assert!(tx_context::sender(ctx) == game_state.dev_wallet, ENotAuthorized);
         
-        let withdrawal = coin::take(&mut game_state.fee_pool, amount, ctx);
-        transfer::public_transfer(withdrawal, game_state.dev_wallet);
+        let amount = balance::value(&game_state.fee_balance);
+        let withdrawn = coin::take(&mut game_state.fee_balance, amount, ctx);
+        transfer::public_transfer(withdrawn, game_state.dev_wallet);
     }
 
-    // ======== View Functions ========
-    
-    public fun get_farm_info(farm: &Farm): (u64, u64, u64, u8) {
-        (farm.mushroom_count, farm.last_harvest, farm.total_harvested, farm.upgrade_level)
+    /// View functions
+    public fun get_farm_info(game_state: &GameState, farm_id: u64): (address, u64, u64, u64, u64) {
+        let farm = vector::borrow(&game_state.farms, farm_id);
+        (farm.owner, farm.mushrooms, farm.level, farm.last_harvest_epoch, farm.created_at_epoch)
     }
 
-    public fun get_game_stats(game_state: &GameState): (u64, u64) {
-        (game_state.total_farms, game_state.total_harvested)
+    public fun get_game_stats(game_state: &GameState): (u64, u64, u64) {
+        (game_state.total_farms, game_state.total_shrooms_minted, balance::value(&game_state.fee_balance))
     }
 }
